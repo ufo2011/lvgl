@@ -41,6 +41,7 @@ typedef struct {
     uint32_t selector : 24;
     uint32_t is_local : 1;
     uint32_t is_trans : 1;
+    uint32_t is_cache : 1;
 } _lv_obj_style_t;
 
 typedef struct {

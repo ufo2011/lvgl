@@ -185,6 +185,7 @@ typedef struct _lv_obj_t {
     uint16_t layout_inv : 1;
     uint16_t scr_layout_inv : 1;
     uint16_t skip_trans : 1;
+    uint16_t skip_cache : 1;
     uint16_t style_cnt  : 6;
     uint16_t h_layout   : 1;
     uint16_t w_layout   : 1;

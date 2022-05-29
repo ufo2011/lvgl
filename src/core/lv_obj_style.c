@@ -27,14 +27,6 @@ typedef struct {
     lv_style_value_t end_value;
 } trans_t;
 
-typedef enum {
-    CACHE_ZERO = 0,
-    CACHE_TRUE = 1,
-    CACHE_UNSET = 2,
-    CACHE_255 = 3,
-    CACHE_NEED_CHECK = 4,
-} cache_t;
-
 /**********************
  *  GLOBAL PROTOTYPES
  **********************/
@@ -43,7 +35,8 @@ typedef enum {
  *  STATIC PROTOTYPES
  **********************/
 static lv_style_t * get_local_style(lv_obj_t * obj, lv_style_selector_t selector);
-static _lv_obj_style_t * get_trans_style(lv_obj_t * obj, uint32_t part);
+static lv_style_t * get_trans_style(lv_obj_t * obj, uint32_t part);
+static lv_style_t * get_cache_style(lv_obj_t * obj, uint32_t part);
 static bool get_prop_core(const lv_obj_t * obj, lv_part_t part, lv_style_prop_t prop, lv_style_value_t * v);
 static void report_style_change_core(void * style, lv_obj_t * obj);
 static void refresh_children_style(lv_obj_t * obj);
@@ -174,6 +167,16 @@ void lv_obj_refresh_style(lv_obj_t * obj, lv_style_selector_t selector, lv_style
 
     lv_part_t part = lv_obj_style_get_selector_part(selector);
 
+    uint32_t i;
+    for(i = 0; i < obj->style_cnt; i++) {
+        if(obj->styles[i].is_cache) {
+            if(part == obj->styles[i].selector || part == LV_PART_ANY) {
+                if(prop == LV_STYLE_PROP_ANY) lv_style_reset(obj->styles[i].style);
+                else lv_style_remove_prop(obj->styles[i].style, prop);
+            }
+        }
+    }
+
     bool is_layout_refr = lv_style_prop_has_flag(prop, LV_STYLE_PROP_LAYOUT_REFR);
     bool is_ext_draw = lv_style_prop_has_flag(prop, LV_STYLE_PROP_EXT_DRAW);
     bool is_inherit = lv_style_prop_has_flag(prop, LV_STYLE_PROP_INHERIT);
@@ -223,8 +226,38 @@ void lv_obj_enable_style_refresh(bool en)
 lv_style_value_t lv_obj_get_style_prop(const lv_obj_t * obj, lv_part_t part, lv_style_prop_t prop)
 {
     lv_style_value_t value_act;
+
+    lv_style_t * cache_style = NULL;
+    uint32_t i;
+    bool found;
+    uint8_t group = 1 << _lv_style_get_prop_group(prop);
+    bool skip_cache = obj->skip_cache;
+    /*Check the cache style first*/
+    if(!skip_cache) {
+        for(i = 0; i < obj->style_cnt; i++) {
+            _lv_obj_style_t * obj_style = &obj->styles[i];
+            if(obj_style->is_cache == false) break;
+
+            if(obj->styles[i].selector != part) continue;
+            if((obj_style->style->has_group & group) == 0) continue;
+            found = lv_style_get_prop(obj_style->style, prop, &value_act);
+            if(found) {
+                return value_act;
+            }
+            else {
+                cache_style = obj_style->style;
+                break;
+            }
+        }
+
+        if(cache_style == NULL) {
+            cache_style = get_cache_style((lv_obj_t *)obj, part);
+        }
+    }
+
+
     bool inherit = lv_style_prop_has_flag(prop, LV_STYLE_PROP_INHERIT);
-    bool found = false;
+    found = false;
     while(obj) {
         found = get_prop_core(obj, part, prop, &value_act);
         if(found) break;
@@ -263,6 +296,10 @@ lv_style_value_t lv_obj_get_style_prop(const lv_obj_t * obj, lv_part_t part, lv_
         else {
             value_act = lv_style_prop_get_default(prop);
         }
+    }
+
+    if(!skip_cache) {
+        lv_style_set_prop(cache_style, prop, value_act);
     }
     return value_act;
 }
@@ -316,19 +353,21 @@ void _lv_obj_style_create_transition(lv_obj_t * obj, lv_part_t part, lv_state_t 
 
     /*Get the previous and current values*/
     obj->skip_trans = 1;
+    obj->skip_cache = 1;
     obj->state = prev_state;
     lv_style_value_t v1 = lv_obj_get_style_prop(obj, part, tr_dsc->prop);
     obj->state = new_state;
     lv_style_value_t v2 = lv_obj_get_style_prop(obj, part, tr_dsc->prop);
     obj->skip_trans = 0;
+    obj->skip_cache = 0;
 
     if(v1.ptr == v2.ptr && v1.num == v2.num && v1.color.full == v2.color.full)  return;
     obj->state = prev_state;
     v1 = lv_obj_get_style_prop(obj, part, tr_dsc->prop);
     obj->state = new_state;
 
-    _lv_obj_style_t * style_trans = get_trans_style(obj, part);
-    lv_style_set_prop(style_trans->style, tr_dsc->prop, v1);   /*Be sure `trans_style` has a valid value*/
+    lv_style_t * style_trans = get_trans_style(obj, part);
+    lv_style_set_prop(style_trans, tr_dsc->prop, v1);   /*Be sure `trans_style` has a valid value*/
 
     if(tr_dsc->prop == LV_STYLE_RADIUS) {
         if(v1.num == LV_RADIUS_CIRCLE || v2.num == LV_RADIUS_CIRCLE) {
@@ -509,9 +548,9 @@ static lv_style_t * get_local_style(lv_obj_t * obj, lv_style_selector_t selector
     LV_ASSERT_MALLOC(obj->styles);
 
     for(i = obj->style_cnt - 1; i > 0 ; i--) {
-        /*Copy only normal styles (not local and transition).
+        /*Copy only normal styles (not local, transition or cache).
          *The new local style will be added as the last local style*/
-        if(obj->styles[i - 1].is_local || obj->styles[i - 1].is_trans) break;
+        if(obj->styles[i - 1].is_local || obj->styles[i - 1].is_trans || obj->styles[i - 1].is_cache) break;
         obj->styles[i] = obj->styles[i - 1];
     }
 
@@ -524,21 +563,51 @@ static lv_style_t * get_local_style(lv_obj_t * obj, lv_style_selector_t selector
 }
 
 /**
- * Get the transition style of an object for a given part and for a given state.
+ * Get the transition style of an object for a given part.
+ * If the transition style for the part-state pair doesn't exist allocate and return it.
+ * @param obj       pointer to an object
+ * @param part      LV_PART_...
+ * @return          pointer to the transition style
+ */
+static lv_style_t * get_trans_style(lv_obj_t * obj,  uint32_t part)
+{
+    uint32_t i;
+    for(i = 0; i < obj->style_cnt; i++) {
+        if(obj->styles[i].is_trans && obj->styles[i].selector == part) return obj->styles[i].style;
+    }
+
+    obj->style_cnt++;
+    obj->styles = lv_mem_realloc(obj->styles, obj->style_cnt * sizeof(_lv_obj_style_t));
+
+
+    for(i = obj->style_cnt - 1; i > 0 ; i--) {
+        /*Copy normal and local styles.
+         *The new transition style will be added as the last transition style*/
+        if(obj->styles[i - 1].is_trans || obj->styles[i - 1].is_cache) break;
+        obj->styles[i] = obj->styles[i - 1];
+    }
+
+    lv_memset_00(&obj->styles[i], sizeof(_lv_obj_style_t));
+    obj->styles[i].style = lv_mem_alloc(sizeof(lv_style_t));
+    lv_style_init(obj->styles[i].style);
+    obj->styles[i].is_trans = 1;
+    obj->styles[i].selector = part;
+    return obj->styles[i].style;
+}
+
+/**
+ * Get the transition style of an object for a given part.
  * If the transition style for the part-state pair doesn't exist allocate and return it.
  * @param obj   pointer to an object
  * @param selector OR-ed value of parts and state for which the style should be get
  * @return pointer to the transition style
  */
-static _lv_obj_style_t * get_trans_style(lv_obj_t * obj,  lv_style_selector_t selector)
+static lv_style_t * get_cache_style(lv_obj_t * obj,  uint32_t part)
 {
     uint32_t i;
     for(i = 0; i < obj->style_cnt; i++) {
-        if(obj->styles[i].is_trans && obj->styles[i].selector == selector) break;
+        if(obj->styles[i].is_cache && obj->styles[i].selector == part) return obj->styles[i].style;
     }
-
-    /*Already have a transition style for it*/
-    if(i != obj->style_cnt) return &obj->styles[i];
 
     obj->style_cnt++;
     obj->styles = lv_mem_realloc(obj->styles, obj->style_cnt * sizeof(_lv_obj_style_t));
@@ -550,9 +619,9 @@ static _lv_obj_style_t * get_trans_style(lv_obj_t * obj,  lv_style_selector_t se
     lv_memset_00(&obj->styles[0], sizeof(_lv_obj_style_t));
     obj->styles[0].style = lv_mem_alloc(sizeof(lv_style_t));
     lv_style_init(obj->styles[0].style);
-    obj->styles[0].is_trans = 1;
-    obj->styles[0].selector = selector;
-    return &obj->styles[0];
+    obj->styles[0].is_cache = 1;
+    obj->styles[0].selector = part;
+    return obj->styles[0].style;
 }
 
 
@@ -566,8 +635,11 @@ static bool get_prop_core(const lv_obj_t * obj, lv_part_t part, lv_style_prop_t 
     bool skip_trans = obj->skip_trans;
     uint32_t i;
     bool found;
+
+    /*Check the transition styles*/
     for(i = 0; i < obj->style_cnt; i++) {
         _lv_obj_style_t * obj_style = &obj->styles[i];
+        if(obj_style->is_cache == true) continue;
         if(obj_style->is_trans == false) break;
         if(skip_trans) continue;
 
@@ -582,6 +654,7 @@ static bool get_prop_core(const lv_obj_t * obj, lv_part_t part, lv_style_prop_t 
         }
     }
 
+    /*Check normal styles*/
     for(; i < obj->style_cnt; i++) {
         if((obj->styles[i].style->has_group & group) == 0) continue;
         _lv_obj_style_t * obj_style = &obj->styles[i];
@@ -779,8 +852,8 @@ static void trans_anim_start_cb(lv_anim_t * a)
 
     tr->prop = prop_tmp;
 
-    _lv_obj_style_t * style_trans = get_trans_style(tr->obj, tr->selector);
-    lv_style_set_prop(style_trans->style, tr->prop, tr->start_value);   /*Be sure `trans_style` has a valid value*/
+    lv_style_t * style_trans = get_trans_style(tr->obj, tr->selector);
+    lv_style_set_prop(style_trans, tr->prop, tr->start_value);   /*Be sure `trans_style` has a valid value*/
 
 }
 
